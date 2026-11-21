@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # LeafTV v15 — Home UI + immersive wallpaper Back
 
 - Smaller Home app cards (102×96 dp, 44 dp icons) with individual focus zoom.
@@ -19,3 +20,7 @@ bash UPGRADE-V15-TERMUX.sh && bash INSTALL-V15-TERMUX.sh
 Version verification: `adb shell dumpsys package com.leaftv.launcher | grep versionName` should print **15.0**. Same signing key required for update; do not uninstall the older version, as that would erase your app preferences.
 
 Wallpaper source files downloaded earlier remain in the user's existing project and are not included in the source ZIP. A fresh clone must supply them before offline builds. The complete APK cannot be compiled in this environment without the Android SDK and those images; source syntax and unit tests can run here.
+=======
+# LeafTV-Naruto
+Lightweight custom Android TV launcher
+>>>>>>> origin/main
