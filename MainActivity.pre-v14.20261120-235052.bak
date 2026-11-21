@@ -1,0 +1,1324 @@
+package com.leaftv.home
+
+import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.Shader
+import android.graphics.Typeface
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.SystemClock
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
+import android.text.TextUtils
+import android.util.LruCache
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextClock
+import android.widget.TextView
+import java.io.File
+import java.io.FileInputStream
+import java.io.InputStream
+import java.util.Collections
+import java.util.Random
+import java.util.concurrent.Executors
+
+class Skin(val name: String, val colors: IntArray, val accent: Int)
+
+val SKINS = listOf(
+    Skin("Hidden Leaf", intArrayOf(Color.parseColor("#1B1209"), Color.parseColor("#B3460C"), Color.parseColor("#FFA94D")), Color.parseColor("#FF922B")),
+    Skin("Akatsuki", intArrayOf(Color.parseColor("#0B0B0F"), Color.parseColor("#4A0A12"), Color.parseColor("#C0182A")), Color.parseColor("#E03131")),
+    Skin("Survey Corps", intArrayOf(Color.parseColor("#0F1A14"), Color.parseColor("#2F5D45"), Color.parseColor("#9DB8A5")), Color.parseColor("#51CF66")),
+    Skin("Demon Slayer", intArrayOf(Color.parseColor("#07211F"), Color.parseColor("#0E6B5C"), Color.parseColor("#7FD6B6")), Color.parseColor("#20C997")),
+    Skin("Night Sky", intArrayOf(Color.parseColor("#05060F"), Color.parseColor("#1B2A6B"), Color.parseColor("#6C8CFF")), Color.parseColor("#4C6EF5"))
+)
+
+class AppEntry(val label: String, val pkg: String, val cls: String, val icon: Bitmap)
+class Pack(val name: String, val items: List<String>)
+class MenuItem(val label: String, val value: String? = null, val selected: Boolean = false, val action: () -> Unit)
+class MenuScreen(val title: String, val build: () -> List<MenuItem>)
+
+class MainActivity : Activity() {
+
+    private lateinit var prefs: SharedPreferences
+    private lateinit var bgA: ImageView
+    private lateinit var bgB: ImageView
+    private lateinit var scrim: View
+    private lateinit var ui: FrameLayout
+    private lateinit var row: LinearLayout
+    private lateinit var tray: HorizontalScrollView
+    private lateinit var homeScroll: ScrollView
+    private lateinit var watchingRow: LinearLayout
+    private lateinit var watchingBar: LinearLayout
+    private lateinit var overlay: FrameLayout
+    private lateinit var panel: LinearLayout
+
+    private var frontIsA = true
+    private var skinIdx = 0
+    private var showAll = false
+    private var wpIndex = 0
+    private var hasWallpaper = false
+    private var currentPack = ""
+    private var intervalSec = 30
+    private var uiVisible = true
+    // LEAFTV_V11_CINEMATIC_UI
+    private var lastHomeRenderMs = 0L
+    private val menuFocusPositions = HashMap<MenuScreen, Int>()
+    private var renderedMenu: MenuScreen? = null
+    private var watchingGeneration = 0
+    private var lastFocusPkg: String? = null
+
+    private var appCache: List<AppEntry>? = null
+    private val iconCache = LruCache<String, Bitmap>(256)
+    private val menuStack = ArrayList<MenuScreen>()
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val io = Executors.newSingleThreadExecutor()
+    private val rotate = object : Runnable {
+        override fun run() {
+            nextWallpaper()
+            scheduleRotation()
+        }
+    }
+    private val pkgReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            appCache = null
+            if (uiVisible && menuStack.isEmpty()) {
+                rebuildTray()
+                rebuildWatchNextRow()
+            }
+        }
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    private val skin: Skin get() = SKINS[skinIdx]
+
+    // ================= Lifecycle =================
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        prefs = getSharedPreferences("leaftv", MODE_PRIVATE)
+        skinIdx = prefs.getInt("skin", 0).coerceIn(0, SKINS.size - 1)
+        showAll = prefs.getBoolean("showAll", false)
+        intervalSec = prefs.getInt("interval", 30)
+        wpIndex = prefs.getInt("wpIndex", 0)
+        currentPack = prefs.getString("pack", "") ?: ""
+        buildUi()
+
+        val f = IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addAction(Intent.ACTION_PACKAGE_REPLACED)
+            addDataScheme("package")
+        }
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(pkgReceiver, f, Context.RECEIVER_EXPORTED)
+        else registerReceiver(pkgReceiver, f)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        hideSystemBars()
+        rebuildTray()
+        rebuildWatchNextRow()
+        renderNextHomeWallpaper()
+        scheduleRotation()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        handler.removeCallbacks(rotate)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)          // HOME pressed: bring controls back
+        menuStack.clear()
+        menuFocusPositions.clear()
+        renderedMenu = null
+        overlay.visibility = View.GONE
+        setUi(true)
+        renderNextHomeWallpaper()
+        rebuildWatchNextRow()
+        tray.smoothScrollTo(0, 0)
+        lastFocusPkg = null
+        focusTray()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { unregisterReceiver(pkgReceiver) } catch (e: Exception) { }
+        io.shutdownNow()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun hideSystemBars() {
+        window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
+    }
+
+    // ================= UI =================
+
+    private fun buildUi() {
+        val match = ViewGroup.LayoutParams.MATCH_PARENT
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+
+        val root = FrameLayout(this)
+        root.setBackgroundColor(Color.BLACK)
+
+        bgA = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+        bgB = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; alpha = 0f }
+        root.addView(bgA, FrameLayout.LayoutParams(match, match))
+        root.addView(bgB, FrameLayout.LayoutParams(match, match))
+
+        // Light scrim so the wallpaper colours stay visible
+        scrim = View(this)
+        scrim.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(Color.argb(38, 0, 0, 0), Color.TRANSPARENT, Color.argb(115, 5, 9, 19))
+        )
+        root.addView(scrim, FrameLayout.LayoutParams(match, match))
+
+        ui = FrameLayout(this)
+        ui.clipChildren = false
+        root.addView(ui, FrameLayout.LayoutParams(match, match))
+
+        val clockBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        clockBox.addView(TextClock(this).apply {
+            format12Hour = "h:mm"
+            format24Hour = "HH:mm"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 38f)
+            typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+            setShadowLayer(8f, 0f, 2f, Color.argb(160, 0, 0, 0))
+        })
+        clockBox.addView(TextClock(this).apply {
+            format12Hour = "EEEE, d MMMM"
+            format24Hour = "EEEE, d MMMM"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setShadowLayer(8f, 0f, 2f, Color.argb(160, 0, 0, 0))
+        })
+        ui.addView(clockBox, FrameLayout.LayoutParams(wrap, wrap, Gravity.TOP or Gravity.START).apply {
+            leftMargin = dp(28); topMargin = dp(23)
+        })
+
+        // LEAFTV_V13_VIDEO_STYLE: video-inspired scrolling Home, wallpaper remains behind it.
+        homeScroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            isSmoothScrollingEnabled = true
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isFillViewport = true
+            clipToPadding = true
+            descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+        }
+        val homeBody = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(32), 0, dp(32), dp(46))
+            clipChildren = true
+            clipToPadding = true
+        }
+        // The wallpaper is the hero. Keep substantial space above the apps.
+        homeBody.addView(View(this), LinearLayout.LayoutParams(match, dp(245)))
+        homeBody.addView(TextView(this).apply {
+            text = "Your apps"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 21f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setShadowLayer(dp(4).toFloat(), 0f, dp(2).toFloat(), Color.BLACK)
+            setPadding(dp(5), 0, 0, dp(8))
+        })
+        row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            clipChildren = false
+            clipToPadding = false
+            setPadding(dp(7), dp(4), dp(7), dp(4))
+        }
+        tray = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            isSmoothScrollingEnabled = true
+            isFillViewport = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            clipChildren = true
+            clipToPadding = true
+            // No opaque pill: the circular app icons float over the wallpaper.
+            addView(row, FrameLayout.LayoutParams(wrap, wrap))
+        }
+        homeBody.addView(tray, LinearLayout.LayoutParams(match, dp(88)))
+        homeBody.addView(View(this), LinearLayout.LayoutParams(match, dp(18)))
+        homeBody.addView(TextView(this).apply {
+            text = "Continue watching"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 21f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setShadowLayer(dp(4).toFloat(), 0f, dp(2).toFloat(), Color.BLACK)
+            setPadding(dp(5), dp(2), 0, dp(11))
+        })
+        // Each lane owns its own left-right scroll; the Home page owns up-down scroll.
+        watchingBar = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(8))
+            clipChildren = true
+            clipToPadding = true
+        }
+        watchingRow = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            clipChildren = true
+            clipToPadding = true
+        }
+        watchingBar.addView(watchingRow)
+        homeBody.addView(watchingBar, LinearLayout.LayoutParams(match, wrap))
+        homeScroll.addView(homeBody, FrameLayout.LayoutParams(match, wrap))
+        ui.addView(homeScroll, FrameLayout.LayoutParams(match, match))
+
+        // Options lives in the top-right corner, not among installed apps.
+        val options = TextView(this).apply {
+            text = "⚙  Options"
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(17), dp(9), dp(17), dp(9))
+            isFocusable = true
+            isClickable = true
+            background = rounded(Color.argb(180, 18, 23, 35), 24)
+            setOnClickListener { openMenu(rootMenu()) }
+            setOnFocusChangeListener { view, focused ->
+                view.background = GradientDrawable().apply {
+                    cornerRadius = dp(24).toFloat()
+                    setColor(Color.argb(190, 18, 23, 35))
+                    setStroke(dp(if (focused) 2 else 1),
+                        if (focused) Color.WHITE else Color.argb(72, 220, 230, 255))
+                }
+            }
+        }
+        ui.addView(options, FrameLayout.LayoutParams(wrap, wrap, Gravity.TOP or Gravity.END).apply {
+            topMargin = dp(24); rightMargin = dp(30)
+        })
+
+        // Menu overlay (right-hand panel)
+        overlay = FrameLayout(this)
+        overlay.setBackgroundColor(Color.argb(100, 0, 0, 0))
+        overlay.visibility = View.GONE
+        overlay.isClickable = true
+        overlay.setOnClickListener { closeMenuTop() }
+        panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(24), dp(16), dp(24))
+        }
+        val panelScroll = ScrollView(this).apply {
+            setBackgroundColor(Color.argb(238, 14, 14, 18))
+            isClickable = true
+            addView(panel, FrameLayout.LayoutParams(match, wrap))
+        }
+        overlay.addView(panelScroll, FrameLayout.LayoutParams(dp(400), match, Gravity.END))
+        root.addView(overlay, FrameLayout.LayoutParams(match, match))
+
+        setContentView(root)
+        hideSystemBars()
+    }
+
+    private fun setUi(visible: Boolean) {
+        uiVisible = visible
+        val vis = if (visible) View.VISIBLE else View.INVISIBLE
+        ui.visibility = vis
+        scrim.visibility = vis
+        if (visible) {
+            homeScroll.post { homeScroll.smoothScrollTo(0, 0) }
+            focusTray()
+        }
+    }
+
+    private fun focusTray() {
+        row.post {
+            if (!uiVisible || menuStack.isNotEmpty() || row.childCount == 0) return@post
+            var target: View? = null
+            for (i in 0 until row.childCount) {
+                if (row.getChildAt(i).tag == lastFocusPkg) target = row.getChildAt(i)
+            }
+            if (target == null) target = row.getChildAt(0)
+            target?.requestFocus()
+        }
+    }
+
+    // ================= Apps =================
+
+    private fun toBitmap(d: Drawable, size: Int): Bitmap {
+        val b = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        d.setBounds(0, 0, size, size)
+        d.draw(Canvas(b))
+        return b
+    }
+
+    private fun apps(): List<AppEntry> {
+        appCache?.let { return it }
+        val pm = packageManager
+        fun query(cat: String) = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(cat), 0)
+        var res = query(Intent.CATEGORY_LEANBACK_LAUNCHER)
+        if (showAll || res.isEmpty()) res = res + query(Intent.CATEGORY_LAUNCHER)
+        val list = res
+            .filter { it.activityInfo.packageName != packageName }
+            .distinctBy { it.activityInfo.packageName + "/" + it.activityInfo.name }
+            .map { ri ->
+                val pkg = ri.activityInfo.packageName
+                val stamp = try { pm.getPackageInfo(pkg, 0).lastUpdateTime } catch (e: Exception) { 0L }
+                val key = "$pkg@$stamp"
+                val icon = iconCache.get(key) ?: toBitmap(ri.loadIcon(pm), dp(44)).also { iconCache.put(key, it) }
+                AppEntry(ri.loadLabel(pm).toString(), pkg, ri.activityInfo.name, icon)
+            }
+        appCache = list
+        return list
+    }
+
+    private fun pins(): MutableList<String> =
+        (prefs.getString("pins", "") ?: "").split(",").filter { it.isNotEmpty() }.toMutableList()
+
+    private fun savePins(l: List<String>) = prefs.edit().putString("pins", l.joinToString(",")).apply()
+
+    private fun orderedApps(): List<AppEntry> {
+        val all = apps()
+        val pinned = pins().mapNotNull { p -> all.firstOrNull { it.pkg == p } }
+        val rest = all.filter { a -> pinned.none { it.pkg == a.pkg } }.sortedBy { it.label.lowercase() }
+        return pinned + rest
+    }
+
+    private fun rebuildTray() {
+        row.removeAllViews()
+        val all = apps()
+        // First install: make a small starter selection. After that, even an empty
+        // favorites tray is intentional and must not repopulate automatically.
+        if (!prefs.getBoolean("favorites_initialized", false)) {
+            val existing = pins()
+            if (existing.isEmpty()) savePins(all.take(4).map { it.pkg })
+            prefs.edit().putBoolean("favorites_initialized", true).apply()
+        }
+        val byPkg = all.associateBy { it.pkg }
+        for (pkg in pins().distinct()) {
+            val app = byPkg[pkg] ?: continue
+            val iv = ImageView(this).apply {
+                setImageBitmap(app.icon)
+                layoutParams = LinearLayout.LayoutParams(dp(32), dp(32))
+            }
+            row.addView(tile(app.label, iv, app.pkg, { launch(app) }, { openMenu(appMenu(app)) }, true))
+        }
+        row.addView(tile("All Apps", badge("+"), "__all__", { openMenu(allAppsMenu()) }, null))
+        focusTray()
+    }
+
+    /** "Previously watched" here means recently OPENED through this launcher.
+     * Other apps' private video history is not readable without an exported API.
+     */
+    private fun streamingApp(app: AppEntry): Boolean {
+        val hint = (app.label + " " + app.pkg).lowercase()
+        return hint.contains("smarttube") || hint.contains("cloudstream") || hint.contains("nuvio")
+    }
+
+    private fun allAppsMenu() = MenuScreen("All Apps") {
+        val all = apps()
+        if (all.isEmpty()) listOf(MenuItem("No launchable apps found") { })
+        else all.sortedBy { it.label.lowercase() }.map { app ->
+            val pinned = app.pkg in pins()
+            MenuItem(app.label, if (pinned) "Pinned" else "+ Pin") {
+                openMenu(appMenu(app))
+            }
+        }
+    }
+
+    private fun favoritesMenu() = MenuScreen("Edit Favorites") {
+        val all = apps().associateBy { it.pkg }
+        val list = pins().mapNotNull { all[it] }
+        if (list.isEmpty()) listOf(MenuItem("No favorites — add apps from All Apps") { openMenu(allAppsMenu()) })
+        else list.mapIndexed { index, app ->
+            MenuItem("${index + 1}. ${app.label}", "Edit") { openMenu(appMenu(app)) }
+        }
+    }
+
+    private fun badge(letter: String): TextView = TextView(this).apply {
+        text = letter
+        gravity = Gravity.CENTER
+        setTextColor(Color.WHITE)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+        typeface = Typeface.DEFAULT_BOLD
+        background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(skin.accent) }
+        layoutParams = LinearLayout.LayoutParams(dp(32), dp(32))
+    }
+
+    private fun rounded(color: Int, radius: Int = 14): GradientDrawable =
+        GradientDrawable().apply { cornerRadius = dp(radius).toFloat(); setColor(color) }
+
+    private fun accentA(alpha: Int): Int {
+        val a = skin.accent
+        return Color.argb(alpha, Color.red(a), Color.green(a), Color.blue(a))
+    }
+
+    // LEAFTV_V13_VIDEO_STYLE: circular apps; a light ring follows focus, with no bulky tile.
+    private fun tile(
+        label: String, icon: View, tag: String,
+        onClick: () -> Unit, onLong: (() -> Unit)?, pinned: Boolean = false
+    ): View {
+        val v = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(3), dp(4), dp(3), dp(3))
+            layoutParams = LinearLayout.LayoutParams(dp(77), dp(76)).apply { marginEnd = dp(6) }
+            background = rounded(Color.TRANSPARENT, 18)
+            isFocusable = true
+            isClickable = true
+            this.tag = tag
+            contentDescription = label
+        }
+        val circle = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(53), dp(53))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(210, 30, 35, 48))
+                setStroke(dp(1), Color.argb(100, 235, 240, 255))
+            }
+            clipToOutline = true
+        }
+        icon.layoutParams = FrameLayout.LayoutParams(dp(40), dp(40), Gravity.CENTER)
+        if (icon is ImageView) icon.scaleType = ImageView.ScaleType.CENTER_INSIDE
+        circle.addView(icon)
+        v.addView(circle)
+        val caption = TextView(this).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            gravity = Gravity.CENTER
+            alpha = 0.0f
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(2) }
+        }
+        v.addView(caption)
+        v.setOnClickListener { onClick() }
+        if (onLong != null) {
+            v.isLongClickable = true
+            v.setOnLongClickListener { onLong(); true }
+        }
+        // Repeat ACTION_DOWN events let a held remote key advance across apps.
+        v.setOnKeyListener { view, code, event ->
+            if (code != KeyEvent.KEYCODE_DPAD_LEFT && code != KeyEvent.KEYCODE_DPAD_RIGHT) false
+            else {
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    val current = row.indexOfChild(view)
+                    val step = if (code == KeyEvent.KEYCODE_DPAD_RIGHT) 1 else -1
+                    val next = current + step
+                    if (current >= 0 && next in 0 until row.childCount) {
+                        val target = row.getChildAt(next)
+                        target.requestFocus()
+                        val center = target.left + target.width / 2
+                        val offset = (center - tray.width / 2)
+                            .coerceIn(0, (row.width - tray.width).coerceAtLeast(0))
+                        tray.smoothScrollTo(offset, 0)
+                    }
+                }
+                true
+            }
+        }
+        v.setOnFocusChangeListener { view, focused ->
+            view.animate().cancel()
+            view.animate().scaleX(if (focused) 1.07f else 1f)
+                .scaleY(if (focused) 1.07f else 1f).setDuration(165).start()
+            caption.animate().alpha(if (focused) 1f else 0f).setDuration(130).start()
+            circle.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(220, 30, 35, 48))
+                setStroke(dp(if (focused) 2 else 1),
+                    if (focused) Color.WHITE else Color.argb(100, 235, 240, 255))
+            }
+            if (focused) lastFocusPkg = view.tag as? String
+        }
+        return v
+    }
+
+    private fun launch(app: AppEntry) {
+        try {
+            startActivity(
+                Intent(Intent.ACTION_MAIN).setClassName(app.pkg, app.cls)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+            )
+            if (streamingApp(app)) {
+                prefs.edit().putLong("recent_" + app.pkg, System.currentTimeMillis()).apply()
+                rebuildWatchNextRow()
+            }
+        } catch (e: Exception) { }
+    }
+
+    // ================= Menu overlay =================
+
+    private fun rememberMenuFocus() {
+        val shown = renderedMenu ?: return
+        val focused = panel.findFocus()
+        val index = panel.indexOfChild(focused)
+        if (index >= 1) menuFocusPositions[shown] = index - 1
+    }
+
+    private fun openMenu(s: MenuScreen) {
+        rememberMenuFocus()
+        menuStack.add(s)
+        renderMenu()
+    }
+
+    private fun renderMenu() {
+        if (menuStack.isEmpty()) return
+        val screen = menuStack.last()
+        rememberMenuFocus()
+        overlay.visibility = View.VISIBLE
+        panel.removeAllViews()
+        panel.addView(TextView(this).apply {
+            text = screen.title
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(12), 0, 0, dp(14))
+        })
+        var first: View? = null
+        var sel: View? = null
+        val controls = ArrayList<View>()
+        for (item in screen.build()) {
+            val r = menuRow(item)
+            panel.addView(r)
+            controls.add(r)
+            if (first == null) first = r
+            if (item.selected) sel = r
+        }
+        val saved = menuFocusPositions[screen]
+        val target = if (saved != null && saved in controls.indices) controls[saved] else sel ?: first
+        target?.let { t -> t.post { if (t.isAttachedToWindow) t.requestFocus() } }
+    }
+
+    private fun menuRow(item: MenuItem): View {
+        val r = LinearLayout(this)
+        r.orientation = LinearLayout.HORIZONTAL
+        r.gravity = Gravity.CENTER_VERTICAL
+        r.setPadding(dp(14), 0, dp(14), 0)
+        r.isFocusable = true
+        r.isClickable = true
+        r.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply { bottomMargin = dp(4) }
+        r.background = rounded(Color.TRANSPARENT, 10)
+        r.addView(TextView(this).apply {
+            text = (if (item.selected) "\u25CF  " else "") + item.label
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        if (item.value != null) {
+            r.addView(TextView(this).apply {
+                text = item.value
+                setTextColor(Color.argb(190, 255, 255, 255))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            })
+        }
+        r.setOnClickListener { item.action() }
+        r.setOnFocusChangeListener { view, has ->
+            view.background = rounded(if (has) accentA(200) else Color.TRANSPARENT, 10)
+            if (has && menuStack.isNotEmpty()) {
+                val index = panel.indexOfChild(view)
+                if (index >= 1) renderedMenu?.let { menuFocusPositions[it] = index - 1 }
+            }
+        }
+        return r
+    }
+
+    private fun closeMenuTop(): Boolean {
+        if (menuStack.isEmpty()) return false
+        rememberMenuFocus()
+        menuFocusPositions.remove(menuStack.last())
+        menuStack.removeAt(menuStack.size - 1)
+        if (menuStack.isEmpty()) { overlay.visibility = View.GONE; focusTray() } else renderMenu()
+        return true
+    }
+
+    private fun closeAllMenus() {
+        menuStack.clear()
+        menuFocusPositions.clear()
+        renderedMenu = null
+        overlay.visibility = View.GONE
+        focusTray()
+    }
+
+    private fun rootMenu() = MenuScreen("Options") {
+        listOf(
+            MenuItem("All Apps") { openMenu(allAppsMenu()) },
+            MenuItem("Edit Favorites") { openMenu(favoritesMenu()) },
+            MenuItem("Wallpaper bundle", currentPackName()) { openMenu(packMenu()) },
+            MenuItem("Wallpaper change", "Next Home render") { nextWallpaper() },
+            MenuItem("Theme", skin.name) { openMenu(skinMenu()) },
+            MenuItem("Next wallpaper") { nextWallpaper(); scheduleRotation() },
+            MenuItem("Include phone apps in All Apps", if (showAll) "On" else "Off") {
+                showAll = !showAll
+                prefs.edit().putBoolean("showAll", showAll).apply()
+                appCache = null
+                rebuildTray(); rebuildWatchNextRow(); renderMenu()
+            },
+            MenuItem("Clear pinned apps") { savePins(emptyList()); rebuildTray(); renderMenu() },
+            MenuItem("Android settings") {
+                closeAllMenus()
+                try { startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                catch (e: ActivityNotFoundException) { }
+            }
+        )
+    }
+
+    private fun packMenu() = MenuScreen("Wallpaper bundle") {
+        val name = currentPackName()
+        packs().map { p ->
+            MenuItem(p.name, "${p.items.size}", p.name == name) {
+                currentPack = p.name
+                prefs.edit().putString("pack", p.name).apply()
+                wpIndex = 0
+                nextWallpaper(); scheduleRotation()
+                closeMenuTop()
+            }
+        }
+    }
+
+    private fun intervalLabel(): String = when (intervalSec) {
+        0 -> "Off"; 15 -> "15 s"; 30 -> "30 s"; 60 -> "1 min"; 300 -> "5 min"; else -> "$intervalSec s"
+    }
+
+    private fun intervalMenu() = MenuScreen("Rotation") {
+        listOf("Off" to 0, "15 seconds" to 15, "30 seconds" to 30, "1 minute" to 60, "5 minutes" to 300).map { (l, s) ->
+            MenuItem(l, null, intervalSec == s) {
+                intervalSec = s
+                prefs.edit().putInt("interval", s).apply()
+                scheduleRotation()
+                closeMenuTop()
+            }
+        }
+    }
+
+    private fun skinMenu() = MenuScreen("Theme") {
+        SKINS.mapIndexed { i, s ->
+            MenuItem(s.name, null, i == skinIdx) {
+                skinIdx = i
+                prefs.edit().putInt("skin", i).apply()
+                appCache = appCache
+                rebuildTray()
+                if (currentPackName() == "Generated") nextWallpaper()
+                closeMenuTop()
+            }
+        }
+    }
+
+    private fun appMenu(app: AppEntry) = MenuScreen(app.label) {
+        val p = pins()
+        val idx = p.indexOf(app.pkg)
+        val l = ArrayList<MenuItem>()
+        l.add(MenuItem("Open") { closeAllMenus(); launch(app) })
+        if (idx < 0) {
+            l.add(MenuItem("Pin to Home") { p.add(0, app.pkg); afterPinChange(p, app.pkg) })
+        } else {
+            l.add(MenuItem("Unpin") { p.removeAt(idx); afterPinChange(p, app.pkg) })
+            if (idx > 0) l.add(MenuItem("Move left") { Collections.swap(p, idx, idx - 1); afterPinChange(p, app.pkg) })
+            if (idx < p.size - 1) l.add(MenuItem("Move right") { Collections.swap(p, idx, idx + 1); afterPinChange(p, app.pkg) })
+        }
+        l.add(MenuItem("App info") {
+            closeAllMenus()
+            try {
+                startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + app.pkg))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (e: Exception) { }
+        })
+        l
+    }
+
+    private fun afterPinChange(p: List<String>, focusPkg: String) {
+        savePins(p)
+        lastFocusPkg = focusPkg
+        rebuildTray()
+        if (menuStack.size > 1) closeMenuTop() else closeAllMenus()
+    }
+
+    private data class WatchEntry(
+        val title: String, val pkg: String, val intentUri: String?,
+        val poster: Bitmap?, val updated: Long
+    )
+
+    private fun streamingPackage(pkg: String): Boolean {
+        val id = pkg.lowercase(java.util.Locale.ROOT)
+        return id.contains("smarttube") || id.contains("cloudstream") || id.contains("nuvio")
+    }
+
+    private fun launchWatchEntry(item: WatchEntry) {
+        if (!item.intentUri.isNullOrBlank()) {
+            try {
+                val intent = Intent.parseUri(item.intentUri, Intent.URI_INTENT_SCHEME)
+                // Do not allow programs published by another package to redirect to a third app.
+                if (intent.component != null && intent.component!!.packageName != item.pkg) throw SecurityException()
+                if (intent.`package` != null && intent.`package` != item.pkg) throw SecurityException()
+                intent.setPackage(item.pkg)
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                return
+            } catch (_: Exception) { }
+        }
+        val target = apps().firstOrNull { it.pkg == item.pkg }
+        if (target != null) launch(target)
+        else packageManager.getLaunchIntentForPackage(item.pkg)?.let { startActivity(it) }
+    }
+
+    private fun showWatchingMessage(label: String) {
+        watchingRow.removeAllViews()
+        watchingRow.addView(TextView(this).apply {
+            text = label
+            setTextColor(Color.LTGRAY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(10), dp(12), dp(10), dp(12))
+        })
+    }
+
+    // LEAFTV_WATCHNEXT_V3_ARTWORK: Support https/http and local image URIs safely.
+    private fun decodeWatchArtwork(raw: String?): Bitmap? {
+        if (raw.isNullOrBlank()) return null
+        return try {
+            val uri = Uri.parse(raw)
+            val stream: java.io.InputStream = when (uri.scheme?.lowercase(java.util.Locale.ROOT)) {
+                "https", "http" -> {
+                    val conn = (java.net.URL(raw).openConnection() as java.net.HttpURLConnection)
+                    conn.connectTimeout = 4500
+                    conn.readTimeout = 5500
+                    conn.instanceFollowRedirects = true
+                    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android TV; LeafTV)")
+                    conn.connect()
+                    if (conn.responseCode !in 200..299 ||
+                        (conn.contentType ?: "").lowercase(java.util.Locale.ROOT).let {
+                            !it.startsWith("image/") && !it.startsWith("application/octet-stream")
+                        }) {
+                        conn.disconnect()
+                        return null
+                    }
+                    // Connection is released when this response stream closes.
+                    object : java.io.FilterInputStream(conn.inputStream) {
+                        override fun close() {
+                            super.close()
+                            conn.disconnect()
+                        }
+                    }
+                }
+                "content", "android.resource", "file" -> contentResolver.openInputStream(uri) ?: return null
+                else -> return null
+            }
+            stream.use { input ->
+                val bytes = input.readBytes()
+                if (bytes.size > 5_000_000 || bytes.isEmpty()) return null
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+                var sample = 1
+                while (bounds.outWidth / sample > 512 || bounds.outHeight / sample > 512) sample *= 2
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size,
+                    BitmapFactory.Options().apply { inSampleSize = sample })
+            }
+        } catch (err: Exception) {
+            android.util.Log.w("LeafTV-WatchNext", "Artwork unavailable for " +
+                (Uri.parse(raw).scheme ?: "unknown") + " URI", err)
+            null
+        }
+    }
+
+    // LEAFTV_V7: Diagnostics run inside the launcher process, not adb shell.
+    private fun watchDebug(message: String, error: Throwable? = null) {
+        if (error == null) android.util.Log.e("LeafTV-Debug", "V7 " + message)
+        else android.util.Log.e("LeafTV-Debug", "V7 " + message, error)
+    }
+
+    // LEAFTV_WATCH_NEXT_V2: Independent per-app limits; artwork from provider.
+    private fun rebuildWatchNextRow() {
+        if (!::watchingRow.isInitialized) return
+        val generation = ++watchingGeneration
+        watchDebug("rebuildWatchNextRow invoked; generation=$generation")
+        if (Build.VERSION.SDK_INT < 26) {
+            showWatchingMessage("Continue Watching requires Android TV 8.0+")
+            return
+        }
+        if (checkSelfPermission("android.permission.READ_TV_LISTINGS") != PackageManager.PERMISSION_GRANTED) {
+            watchingRow.removeAllViews()
+            watchingRow.addView(TextView(this).apply {
+                text = "Allow TV listings to show Continue Watching"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(dp(10), dp(12), dp(10), dp(12))
+                isFocusable = true
+                setOnClickListener {
+                    requestPermissions(arrayOf("android.permission.READ_TV_LISTINGS"), 4242)
+                }
+            })
+            return
+        }
+        val previouslyFocused = watchingRow.findFocus()?.tag as? String
+        showWatchingMessage("Loading Continue Watching…")
+        io.execute {
+            data class Preview(val item: WatchEntry, val thumbnail: Bitmap?)
+            val groups = listOf(
+                "org.smarttube.stable" to "SmartTube",
+                "com.lagradost.cloudstream3" to "CloudStream",
+                "com.nuvio.tv" to "Nuvio"
+            )
+            val byPackage = linkedMapOf<String, MutableList<Preview>>()
+            groups.forEach { (pkg, _) -> byPackage[pkg] = mutableListOf() }
+            try {
+                val uri = Uri.parse("content://android.media.tv/watch_next_program")
+                // Query off the UI thread; display up to 8 real entries per package.
+                // Provider ordering varies, so accumulate candidate metadata before choosing.
+                data class Candidate(
+                    val pkg: String, val title: String, val resume: String?,
+                    val artwork: String?, val thumbnailUri: String?, val updated: Long
+                )
+                val candidates = ArrayList<Candidate>()
+                watchDebug("Querying Watch Next as LeafTV")
+                contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    fun str(col: String): String? {
+                        val i = cursor.getColumnIndex(col)
+                        return if (i < 0 || cursor.isNull(i)) null else cursor.getString(i)
+                    }
+                    fun num(col: String): Long {
+                        val i = cursor.getColumnIndex(col)
+                        return if (i < 0 || cursor.isNull(i)) 0L else cursor.getLong(i)
+                    }
+                    while (cursor.moveToNext() && candidates.size < 500) {
+                        val rawPkg = str("package_name") ?: continue
+                        val pkg = if (rawPkg == "com.teamsmart.videomanager.tv" &&
+                            byPackage.containsKey("org.smarttube.stable"))
+                            "org.smarttube.stable" else rawPkg
+                        if (!byPackage.containsKey(pkg)) continue
+                        val title = str("title")?.takeIf { it.isNotBlank() } ?: continue
+                        candidates.add(Candidate(pkg, title, str("intent_uri"),
+                            str("poster_art_uri"), str("thumbnail_uri"),
+                            num("last_engagement_time_utc_millis")))
+                    }
+                }
+                watchDebug("Watch Next returned ${candidates.size} matching entries")
+                for (c in candidates.filter { it.pkg == "com.lagradost.cloudstream3" }) {
+                    watchDebug("CloudStream candidate: time=${c.updated}, title=${c.title.take(65)}")
+                }
+
+                // SmartTube's TV recommendations may live in Preview Programs attached
+                // to its History channel, separate from Watch Next. Query both sources.
+                try {
+                    val historyChannels = HashSet<Long>()
+                    var channelTotal = 0
+                    val channelUri = Uri.parse("content://android.media.tv/channel")
+                    contentResolver.query(channelUri, null, null, null, null)?.use { ch ->
+                        fun s(col: String): String? {
+                            val idx = ch.getColumnIndex(col)
+                            return if (idx < 0 || ch.isNull(idx)) null else ch.getString(idx)
+                        }
+                        fun n(col: String): Long {
+                            val idx = ch.getColumnIndex(col)
+                            return if (idx < 0 || ch.isNull(idx)) 0L else ch.getLong(idx)
+                        }
+                        while (ch.moveToNext() && channelTotal < 500) {
+                            channelTotal++
+                            val pkg = s("package_name") ?: ""
+                            val title = s("display_name") ?: ""
+                            if (pkg.contains("smarttube", true) ||
+                                pkg.contains("teamsmart", true) ||
+                                title.contains("smarttube", true)) {
+                                watchDebug("SmartTube channel: id=${n("_id")}, pkg=$pkg, name=${title.take(80)}")
+                                if (title.contains("history", true) || title.contains("recent", true) ||
+                                    title.contains("watch", true)) historyChannels.add(n("_id"))
+                            }
+                        }
+                    }
+                    watchDebug("Channels examined=$channelTotal, SmartTube history channels=${historyChannels.size}")
+                    var previewTotal = 0
+                    var smartPreviews = 0
+                    contentResolver.query(Uri.parse("content://android.media.tv/preview_program"),
+                        null, null, null, null)?.use { p ->
+                        fun s(col: String): String? {
+                            val idx = p.getColumnIndex(col)
+                            return if (idx < 0 || p.isNull(idx)) null else p.getString(idx)
+                        }
+                        fun n(col: String): Long {
+                            val idx = p.getColumnIndex(col)
+                            return if (idx < 0 || p.isNull(idx)) 0L else p.getLong(idx)
+                        }
+                        while (p.moveToNext() && previewTotal < 1000) {
+                            previewTotal++
+                            val pkg = s("package_name") ?: ""
+                            val belongs = n("channel_id") in historyChannels ||
+                                pkg.contains("smarttube", true) || pkg.contains("teamsmart", true)
+                            if (!belongs) continue
+                            smartPreviews++
+                            val title = s("title")?.takeIf { it.isNotBlank() } ?: continue
+                            watchDebug("SmartTube preview: channel=${n("channel_id")}, title=${title.take(65)}")
+                            candidates.add(Candidate("org.smarttube.stable", title,
+                                s("intent_uri"), s("poster_art_uri"), s("thumbnail_uri"),
+                                n("last_engagement_time_utc_millis")))
+                        }
+                    }
+                    watchDebug("Preview Programs examined=$previewTotal, SmartTube matches=$smartPreviews")
+                } catch (err: Exception) {
+                    watchDebug("History/Preview query failed: ${err.javaClass.simpleName}: ${err.message}", err)
+                }
+
+                val seen = HashSet<String>()
+                // CloudStream: the original code selected latest timestamps first,
+                // which displayed the final two entries. Select earliest two instead.
+                // Other apps retain latest-first selection. This is a UI selection
+                // change, not an assertion about CloudStream's internal database.
+                val orderedCandidates = candidates.filter { it.pkg == "com.lagradost.cloudstream3" }
+                    .sortedWith(compareBy<Candidate> { it.updated == 0L }.thenBy { it.updated }) +
+                    candidates.filter { it.pkg != "com.lagradost.cloudstream3" }
+                        .sortedByDescending { it.updated }
+                for (c in orderedCandidates) {
+                    val dest = byPackage[c.pkg] ?: continue
+                    if (dest.size >= 8) continue
+                    val key = c.pkg + "|" + (c.resume ?: c.title).lowercase(java.util.Locale.ROOT)
+                    if (!seen.add(key)) continue
+                    var poster: Bitmap? = null
+                    // A title can offer either poster or thumbnail. Both are optional.
+                    for (link in listOfNotNull(c.artwork, c.thumbnailUri).distinct()) {
+                        poster = decodeWatchArtwork(link)
+                        if (poster != null) break
+                    }
+                    dest.add(Preview(WatchEntry(c.title, c.pkg, c.resume, poster, c.updated), poster))
+                    watchDebug("Selected ${c.pkg}: time=${c.updated}, title=${c.title.take(65)}")
+                }
+            } catch (err: Exception) {
+                watchDebug("Watch Next query failed: ${err.javaClass.simpleName}: ${err.message}", err)
+                android.util.Log.w("LeafTV-WatchNext", "Watch Next provider query failed", err)
+            }
+            runOnUiThread {
+                if (isDestroyed || generation != watchingGeneration) return@runOnUiThread
+                val hadFocus = previouslyFocused != null
+                watchingRow.removeAllViews()
+                // LEAFTV_V11_CINEMATIC_UI: one horizontal filmstrip per source.
+                for ((pkg, label) in groups) {
+                    val entries = byPackage[pkg] ?: emptyList<Preview>()
+                    val app = apps().firstOrNull { it.pkg == pkg }
+                    val icon = app?.icon ?: try {
+                        toBitmap(packageManager.getApplicationIcon(pkg), dp(30))
+                    } catch (_: Exception) { null }
+
+                    val lane = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(9), dp(8), dp(7), dp(8))
+                        background = rounded(Color.argb(209, 18, 24, 37), 15)
+                        clipChildren = true
+                        clipToPadding = true
+                        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(138)).apply {
+                            bottomMargin = dp(11)
+                        }
+                    }
+                    val fixedLabel = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        layoutParams = LinearLayout.LayoutParams(dp(129), ViewGroup.LayoutParams.MATCH_PARENT)
+                    }
+                    fixedLabel.addView(ImageView(this).apply {
+                        if (icon != null) setImageBitmap(icon)
+                        scaleType = ImageView.ScaleType.CENTER_INSIDE
+                        background = GradientDrawable().apply {
+                            shape = GradientDrawable.OVAL
+                            setColor(Color.argb(235, 49, 63, 92))
+                        }
+                        setPadding(dp(4), dp(4), dp(4), dp(4))
+                        layoutParams = LinearLayout.LayoutParams(dp(33), dp(33)).apply {
+                            marginEnd = dp(8)
+                        }
+                    })
+                    fixedLabel.addView(TextView(this).apply {
+                        text = label
+                        setTextColor(Color.WHITE)
+                        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                        maxLines = 1
+                        ellipsize = TextUtils.TruncateAt.END
+                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    })
+                    lane.addView(fixedLabel)
+
+                    val cards = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        clipChildren = true
+                        setPadding(dp(2), dp(2), dp(8), dp(2))
+                    }
+                    if (entries.isEmpty()) {
+                        // No fake viewing history: use a real app launcher fallback.
+                        val launchCard = TextView(this).apply {
+                            text = if (pkg == "org.smarttube.stable") "Open SmartTube · history unavailable" else "Open $label"
+                            gravity = Gravity.CENTER
+                            setTextColor(Color.WHITE)
+                            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                            background = rounded(Color.argb(255, 55, 65, 92), 10)
+                            isFocusable = true
+                            isClickable = true
+                            tag = "watch:open:$pkg"
+                            layoutParams = LinearLayout.LayoutParams(dp(176), dp(110))
+                            setOnClickListener {
+                                val target = apps().firstOrNull { it.pkg == pkg }
+                                if (target != null) launch(target)
+                                else packageManager.getLaunchIntentForPackage(pkg)?.let { startActivity(it) }
+                            }
+                        }
+                        cards.addView(launchCard)
+                    } else {
+                        for ((slot, preview) in entries.withIndex()) {
+                            val entry = preview.item
+                            val card = FrameLayout(this).apply {
+                                layoutParams = LinearLayout.LayoutParams(dp(176), dp(110)).apply {
+                                    marginEnd = dp(10)
+                                }
+                                background = rounded(Color.rgb(34, 42, 63), 12)
+                                clipToOutline = true
+                                isFocusable = true
+                                isClickable = true
+                                tag = "watch:$pkg:$slot"
+                                foreground = GradientDrawable().apply {
+                                    cornerRadius = dp(12).toFloat()
+                                    setColor(Color.TRANSPARENT)
+                                    setStroke(dp(1), Color.argb(55, 190, 208, 241))
+                                }
+                                setOnClickListener { launchWatchEntry(entry) }
+                                setOnFocusChangeListener { view, focused ->
+                                    val scale = 1f // focus is an outline, never overflow from scaling
+                                    view.animate().scaleX(scale).scaleY(scale).setDuration(160).start()
+                                    view.foreground = GradientDrawable().apply {
+                                        cornerRadius = dp(12).toFloat()
+                                        setColor(Color.TRANSPARENT)
+                                        setStroke(dp(if (focused) 2 else 1),
+                                            if (focused) Color.WHITE else Color.argb(55, 190, 208, 241))
+                                    }
+                                }
+                            }
+                            val art = ImageView(this).apply {
+                                if (entry.poster != null) setImageBitmap(entry.poster)
+                                else if (icon != null) setImageBitmap(icon)
+                                scaleType = if (entry.poster != null)
+                                    ImageView.ScaleType.CENTER_CROP else ImageView.ScaleType.CENTER_INSIDE
+                            }
+                            card.addView(art, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                            card.addView(View(this).apply {
+                                background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                                    intArrayOf(Color.TRANSPARENT, Color.argb(215, 4, 8, 20)))
+                            }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                            card.addView(TextView(this).apply {
+                                text = entry.title
+                                setTextColor(Color.WHITE)
+                                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                                maxLines = 2
+                                ellipsize = TextUtils.TruncateAt.END
+                                setShadowLayer(dp(2).toFloat(), 0f, dp(1).toFloat(), Color.BLACK)
+                                setPadding(dp(8), 0, dp(7), dp(7))
+                            }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+                            cards.addView(card)
+                        }
+                    }
+                    val horizontal = HorizontalScrollView(this).apply {
+                        isHorizontalScrollBarEnabled = false
+                        isSmoothScrollingEnabled = true
+                        overScrollMode = View.OVER_SCROLL_NEVER
+                        clipChildren = true
+                        clipToPadding = true
+                        descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+                        addView(cards)
+                    }
+                    lane.addView(horizontal, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+                    watchingRow.addView(lane)
+                }
+                if (hadFocus) {
+                    watchingRow.post {
+                        fun findTag(v: View, value: String): View? {
+                            if (v.tag == value) return v
+                            if (v is ViewGroup) for (i in 0 until v.childCount) {
+                                val found = findTag(v.getChildAt(i), value)
+                                if (found != null) return found
+                            }
+                            return null
+                        }
+                        val target = previouslyFocused?.let { findTag(watchingRow, it) }
+                        target?.requestFocus()
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 4242) rebuildWatchNextRow()
+    }
+
+    // ================= Wallpapers =================
+
+    private fun isImg(n: String) = n.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "webp")
+
+    /** Bundles = sub-folders of assets/wallpapers (built into the APK) and of the device folder. */
+    private fun packs(): List<Pack> {
+        val out = ArrayList<Pack>()
+        try {
+            val loose = ArrayList<String>()
+            for (n in assets.list("wallpapers") ?: emptyArray()) {
+                if (isImg(n)) loose.add("asset:wallpapers/$n")
+                else {
+                    val files = (assets.list("wallpapers/$n") ?: emptyArray())
+                        .filter { isImg(it) }.sorted().map { "asset:wallpapers/$n/$it" }
+                    if (files.isNotEmpty()) out.add(Pack(n, files))
+                }
+            }
+            if (loose.isNotEmpty()) out.add(Pack("Bundled", loose.sorted()))
+        } catch (e: Exception) { }
+        try {
+            val dir = getExternalFilesDir("wallpapers")
+            if (dir != null) {
+                dir.mkdirs()
+                val loose = ArrayList<String>()
+                for (f in (dir.listFiles() ?: emptyArray()).sortedBy { it.name }) {
+                    if (f.isFile && isImg(f.name)) loose.add("file:" + f.path)
+                    else if (f.isDirectory) {
+                        val files = (f.listFiles() ?: emptyArray()).filter { it.isFile && isImg(it.name) }
+                            .sortedBy { it.name }.map { "file:" + it.path }
+                        if (files.isNotEmpty()) out.add(Pack(f.name + " (device)", files))
+                    }
+                }
+                if (loose.isNotEmpty()) out.add(Pack("My wallpapers", loose))
+            }
+        } catch (e: Exception) { }
+        if (out.isNotEmpty()) out.add(0, Pack("All images", out.flatMap { it.items }))
+        out.add(Pack("Generated", (0 until 8).map { "gen:$it" }))
+        return out
+    }
+
+    private fun currentPackName(): String {
+        val names = packs().map { it.name }
+        if (currentPack in names) return currentPack
+        return if ("All images" in names) "All images" else "Generated"
+    }
+
+    private fun scheduleRotation() {
+        // Wallpaper changes on Home render or via the manual Next Wallpaper action.
+        handler.removeCallbacks(rotate)
+    }
+
+    private fun renderNextHomeWallpaper() {
+        // onNewIntent and onResume can arrive together; render only once.
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastHomeRenderMs < 800L) return
+        lastHomeRenderMs = now
+        nextWallpaper()
+    }
+
+    private fun nextWallpaper() {
+        val idx = wpIndex++
+        prefs.edit().putInt("wpIndex", wpIndex).apply()
+        val s = skin
+        val dm = resources.displayMetrics
+        val w = dm.widthPixels
+        val h = dm.heightPixels
+        io.execute {
+            val bm = try {
+                val ps = packs()
+                val name = currentPack
+                val pack = ps.firstOrNull { it.name == name }
+                    ?: ps.firstOrNull { it.name == "All images" } ?: ps.last()
+                val src = pack.items[idx % pack.items.size]
+                when {
+                    src.startsWith("gen:") -> gradient(s, src.substring(4).toInt(), w, h)
+                    src.startsWith("asset:") -> decode(w, h) { assets.open(src.substring(6)) }
+                    else -> decode(w, h) { FileInputStream(File(src.substring(5))) }
+                }
+            } catch (t: Throwable) { null }
+            if (bm != null) runOnUiThread { if (!isDestroyed) showBitmap(bm) }
+        }
+    }
+
+    private fun decode(w: Int, h: Int, open: () -> InputStream): Bitmap? {
+        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        open().use { BitmapFactory.decodeStream(it, null, o) }
+        var s = 1
+        while (o.outWidth / (s * 2) >= w && o.outHeight / (s * 2) >= h) s *= 2
+        return open().use { BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = s }) }
+    }
+
+    private fun gradient(s: Skin, variant: Int, w: Int, h: Int): Bitmap {
+        val bw = (w / 2).coerceAtLeast(2)
+        val bh = (h / 2).coerceAtLeast(2)
+        val bm = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bm)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        val flip = variant % 2 == 1
+        p.shader = LinearGradient(
+            if (flip) bw.toFloat() else 0f, 0f, if (flip) 0f else bw.toFloat(), bh.toFloat(),
+            s.colors, null, Shader.TileMode.CLAMP
+        )
+        c.drawRect(0f, 0f, bw.toFloat(), bh.toFloat(), p)
+        p.shader = null
+        val rnd = Random((variant * 31 + s.name.hashCode()).toLong())
+        repeat(7) {
+            p.color = Color.argb(34, Color.red(s.accent), Color.green(s.accent), Color.blue(s.accent))
+            c.drawCircle(rnd.nextFloat() * bw, rnd.nextFloat() * bh, bh * (0.1f + rnd.nextFloat() * 0.4f), p)
+        }
+        return bm
+    }
+
+    private fun showBitmap(bm: Bitmap) {
+        val front = if (frontIsA) bgA else bgB
+        val back = if (frontIsA) bgB else bgA
+        back.setImageBitmap(bm)
+        back.animate().alpha(1f).setDuration(1200).start()
+        front.animate().alpha(0f).setDuration(1200).start()
+        frontIsA = !frontIsA
+        hasWallpaper = true
+    }
+
+    // ================= Keys =================
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // Wallpaper-only mode: any key (Back = "Back again") restores Home, no wallpaper reload
+        if (!uiVisible) {
+            if (event.action == KeyEvent.ACTION_DOWN) setUi(true)
+            return true
+        }
+        if (event.action == KeyEvent.ACTION_DOWN && event.keyCode == KeyEvent.KEYCODE_MENU && menuStack.isEmpty()) {
+            openMenu(rootMenu())
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+    override fun onBackPressed() {
+        if (closeMenuTop()) return        // normal back through overlays
+        setUi(false)                       // Home: first Back = wallpaper only
+    }
+}
