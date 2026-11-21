@@ -1,0 +1,15 @@
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+.env
+wallpaper-imports/
+app/src/main/assets/wallpapers/
+app/src/main/assets/wallpaper-thumbs/
+.DS_Store

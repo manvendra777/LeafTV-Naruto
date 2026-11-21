@@ -1,0 +1,11 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'com.leaftv.launcher'
+    compileSdk 35
+    defaultConfig { applicationId 'com.leaftv.launcher'; minSdk 23; targetSdk 28; versionCode 16; versionName '16.0' }
+    sourceSets { main { assets.srcDirs = ['src/main/assets'] } }
+}
+
+// Bundles up to 55 offline wallpaper assets. Images are imported from local files.
+// Do not redistribute third-party artwork without permission from its copyright owners.
+apply from: '../scripts/bundle-wallpapers.gradle'

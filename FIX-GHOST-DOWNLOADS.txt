@@ -1,0 +1,12 @@
+LeafTV v14: Ghost of Tsushima wallpaper downloader repair
+
+Cause: Old downloader marked the entire WallpaperCat gallery as used after only one image, preventing slots 2-8 from selecting its other images. AlphaCoders HTML requests were also repeatedly failing.
+
+Fixes: 10 direct Ghost of Tsushima image links are attempted first; gallery links may be used for distinct wallpapers; resolved pages/failed URLs are cached; normalized image hashes are checked for duplicates. Existing 43 JPEG wallpapers and thumbnails are reused.
+
+Install from Termux in existing LeafTV project:
+  cd ~/LeafTV/LeafTV
+  unzip -o ~/storage/downloads/LeafTV-v14-ghost-download-repair.zip -d .
+  bash UPGRADE-V14-TERMUX.sh && bash INSTALL-V14-TERMUX.sh
+
+If the direct image hosts and gallery are inaccessible, build still refuses to produce an incomplete 50-wallpaper APK. No device installation takes place on failed build.
