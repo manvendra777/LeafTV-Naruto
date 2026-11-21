@@ -107,10 +107,17 @@ class MainActivity : Activity() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
+    private val recommendationsIo = Executors.newSingleThreadExecutor()
+    private val wallpaperIo = Executors.newSingleThreadExecutor()
+    private val weatherIo = Executors.newSingleThreadExecutor()
+    private val artworkCache = LruCache<String, Bitmap>(48)
+    // LEAFTV_V23_WALLPAPER_MODES: persistent Fixed, Home render, or Timed modes.
     private val rotate = object : Runnable {
         override fun run() {
-            nextWallpaper()
-            scheduleRotation()
+            if (wallpaperChangeMode() == "timed" && !isFinishing && !isDestroyed) {
+                nextWallpaper()
+                scheduleRotation()
+            }
         }
     }
     private val pkgReceiver = object : BroadcastReceiver() {
@@ -150,6 +157,8 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        currentPack = prefs.getString("pack", currentPack) ?: currentPack
+        wpIndex = prefs.getInt("wpIndex", wpIndex)
         hideSystemBars()
         rebuildTray()
         rebuildWatchNextRow()
@@ -187,6 +196,9 @@ class MainActivity : Activity() {
         super.onDestroy()
         try { unregisterReceiver(pkgReceiver) } catch (e: Exception) { }
         io.shutdownNow()
+        recommendationsIo.shutdownNow()
+        wallpaperIo.shutdownNow()
+        weatherIo.shutdownNow()
     }
 
     @Suppress("DEPRECATION")
@@ -342,6 +354,13 @@ class MainActivity : Activity() {
         homeBody.addView(recommendationsRow, LinearLayout.LayoutParams(match, wrap))
         homeScroll.addView(homeBody, FrameLayout.LayoutParams(match, wrap))
         ui.addView(homeScroll, FrameLayout.LayoutParams(match, match))
+
+        // Fade the fixed clock, date and weather while Home scrolls.
+        val headerFadeDistance = dp(150).toFloat()
+        homeScroll.setOnScrollChangeListener { _: View, _: Int, scrollY: Int, _: Int, _: Int ->
+            val progress = (scrollY / headerFadeDistance).coerceIn(0f, 1f)
+            clockBox.alpha = 1f - progress
+        }
 
         // Options lives in the top-right corner, not among installed apps.
         val options = TextView(this).apply {
@@ -727,7 +746,7 @@ class MainActivity : Activity() {
                 startActivity(Intent(this, WallpaperLibraryActivity::class.java))
             },
             MenuItem("Wallpaper collection", currentPackName()) { openMenu(packMenu()) },
-            MenuItem("Wallpaper change", "Next Home render") { nextWallpaper() },
+            MenuItem("Wallpaper change", wallpaperChangeLabel()) { openMenu(wallpaperChangeMenu()) },
             MenuItem("Theme", skin.name) { openMenu(skinMenu()) },
             MenuItem("Next wallpaper") { nextWallpaper(); scheduleRotation() },
             MenuItem("Include phone apps in All Apps", if (showAll) "On" else "Off") {
@@ -758,17 +777,62 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun wallpaperChangeMode(): String =
+        prefs.getString("wallpaper_change_mode", "home") ?: "home"
+
     private fun intervalLabel(): String = when (intervalSec) {
-        0 -> "Off"; 15 -> "15 s"; 30 -> "30 s"; 60 -> "1 min"; 300 -> "5 min"; else -> "$intervalSec s"
+        15 -> "15 seconds"
+        30 -> "30 seconds"
+        60 -> "1 minute"
+        300 -> "5 minutes"
+        900 -> "15 minutes"
+        1800 -> "30 minutes"
+        3600 -> "1 hour"
+        else -> "$intervalSec seconds"
     }
 
-    private fun intervalMenu() = MenuScreen("Rotation") {
-        listOf("Off" to 0, "15 seconds" to 15, "30 seconds" to 30, "1 minute" to 60, "5 minutes" to 300).map { (l, s) ->
-            MenuItem(l, null, intervalSec == s) {
-                intervalSec = s
-                prefs.edit().putInt("interval", s).apply()
+    private fun wallpaperChangeLabel(): String = when (wallpaperChangeMode()) {
+        "fixed" -> "Fixed"
+        "timed" -> "Timed · ${intervalLabel()}"
+        else -> "Next Home render"
+    }
+
+    private fun wallpaperChangeMenu() = MenuScreen("Wallpaper change") {
+        listOf(
+            MenuItem("Fixed — keep current wallpaper", "", wallpaperChangeMode() == "fixed") {
+                prefs.edit().putString("wallpaper_change_mode", "fixed").apply()
                 scheduleRotation()
                 closeMenuTop()
+            },
+            MenuItem("Next Home render", "", wallpaperChangeMode() == "home") {
+                prefs.edit().putString("wallpaper_change_mode", "home").apply()
+                scheduleRotation()
+                closeMenuTop()
+            },
+            MenuItem("Timed rotation", intervalLabel(), wallpaperChangeMode() == "timed") {
+                prefs.edit().putString("wallpaper_change_mode", "timed").apply()
+                scheduleRotation()
+                openMenu(intervalMenu())
+            }
+        )
+    }
+
+    private fun intervalMenu() = MenuScreen("Timed rotation interval") {
+        listOf(
+            "15 seconds" to 15,
+            "30 seconds" to 30,
+            "1 minute" to 60,
+            "5 minutes" to 300,
+            "15 minutes" to 900,
+            "30 minutes" to 1800,
+            "1 hour" to 3600
+        ).map { (label, seconds) ->
+            MenuItem(label, null, wallpaperChangeMode() == "timed" && intervalSec == seconds) {
+                intervalSec = seconds
+                prefs.edit().putInt("interval", seconds)
+                    .putString("wallpaper_change_mode", "timed").apply()
+                scheduleRotation()
+                closeAllMenus()
             }
         }
     }
@@ -859,12 +923,13 @@ class MainActivity : Activity() {
     private fun decodeWatchArtwork(raw: String?): Bitmap? {
         if (raw.isNullOrBlank()) return null
         return try {
+            synchronized(artworkCache) { artworkCache.get(raw) }?.let { return it }
             val uri = Uri.parse(raw)
             val stream: java.io.InputStream = when (uri.scheme?.lowercase(java.util.Locale.ROOT)) {
                 "https", "http" -> {
                     val conn = (java.net.URL(raw).openConnection() as java.net.HttpURLConnection)
-                    conn.connectTimeout = 4500
-                    conn.readTimeout = 5500
+                    conn.connectTimeout = 1800
+                    conn.readTimeout = 2200
                     conn.instanceFollowRedirects = true
                     conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android TV; LeafTV)")
                     conn.connect()
@@ -895,7 +960,9 @@ class MainActivity : Activity() {
                 var sample = 1
                 while (bounds.outWidth / sample > 512 || bounds.outHeight / sample > 512) sample *= 2
                 BitmapFactory.decodeByteArray(bytes, 0, bytes.size,
-                    BitmapFactory.Options().apply { inSampleSize = sample })
+                    BitmapFactory.Options().apply { inSampleSize = sample })?.also { bitmap ->
+                    synchronized(artworkCache) { artworkCache.put(raw, bitmap) }
+                }
             }
         } catch (err: Exception) {
             android.util.Log.w("LeafTV-WatchNext", "Artwork unavailable for " +
@@ -1016,7 +1083,7 @@ class MainActivity : Activity() {
         lastWeatherFetchMs = now
         val city = (prefs.getString("weather_city", "Seattle") ?: "Seattle").trim()
         if (city.isEmpty()) return
-        io.execute {
+        weatherIo.execute {
             val result = try {
                 val encoded = URLEncoder.encode(city, "UTF-8")
                 val found = fetchWeatherJson("https://geocoding-api.open-meteo.com/v1/search?name=$encoded&count=1&language=en&format=json")
@@ -1056,7 +1123,7 @@ class MainActivity : Activity() {
     private fun rebuildRecommendations() {
         if (!::recommendationsRow.isInitialized || Build.VERSION.SDK_INT < 26) return
         val generation = watchingGeneration
-        io.execute {
+        recommendationsIo.execute {
             val published = ArrayList<WatchEntry>()
             try {
                 val historyChannelIds = HashSet<Long>()
@@ -1473,27 +1540,98 @@ class MainActivity : Activity() {
         // Keep subfolders available beneath the three category choices.
         out.addAll(0, categoryPacks)
         if (allArtwork.isNotEmpty()) out.add(0, Pack("All images", allArtwork))
+        if (!prefs.getString("online_carousel_paths", "").isNullOrBlank())
+            out.add(Pack("Online Carousel", listOf("gen:0")))
         out.add(Pack("Generated", (0 until 8).map { "gen:$it" }))
         return out
     }
 
     private fun currentPackName(): String {
+        if (currentPack == "Online Carousel" &&
+            !prefs.getString("online_carousel_paths", "").isNullOrBlank()) return "Online Carousel"
         val names = packs().map { it.name }
         if (currentPack in names) return currentPack
         return if ("All images" in names) "All images" else "Generated"
     }
 
     private fun scheduleRotation() {
-        // Wallpaper changes on Home render or via the manual Next Wallpaper action.
         handler.removeCallbacks(rotate)
+        if (wallpaperChangeMode() == "timed" && !isFinishing && !isDestroyed) {
+            handler.postDelayed(rotate, intervalSec.coerceAtLeast(15) * 1000L)
+        }
     }
 
     private fun renderNextHomeWallpaper() {
+        // Preserve currently displayed wallpaper in Fixed and Timed modes.
+        // A fresh process still needs its first wallpaper rendered.
+        if (hasWallpaper && wallpaperChangeMode() != "home") return
         // onNewIntent and onResume can arrive together; render only once.
         val now = SystemClock.elapsedRealtime()
-        if (now - lastHomeRenderMs < 800L) return
+        if (hasWallpaper && now - lastHomeRenderMs < 800L) return
         lastHomeRenderMs = now
+        // Reuse the most recently shown index after a process restart in Fixed/Timed modes.
+        if (!hasWallpaper && wallpaperChangeMode() != "home") {
+            wpIndex = (wpIndex - 1).coerceAtLeast(0)
+        }
         nextWallpaper()
+    }
+
+    // LEAFTV_V22_STREAMING_CAROUSEL: one cached image, nothing bundled or bulk-downloaded.
+    private fun streamCarouselWallpaper(idx: Int, w: Int, h: Int): Bitmap? {
+        val serialized = prefs.getString("online_carousel_paths", "[]") ?: "[]"
+        val paths = try { org.json.JSONArray(serialized) } catch (_: Exception) { return null }
+        if (paths.length() == 0) return null
+        val path = paths.optString(idx % paths.length())
+        if (path.isEmpty() || !(path.startsWith("wallpapers/") ||
+                path.startsWith("app/src/main/assets/wallpapers/")) || path.contains("..")) return null
+        val encoded = path.split('/').joinToString("/") {
+            java.net.URLEncoder.encode(it, "UTF-8").replace("+", "%20")
+        }
+        val cache = File(cacheDir, "leaftv-online-carousel-current.jpg")
+        val key = File(cacheDir, "leaftv-online-carousel-current-path.txt")
+        // When offline, the already selected picture remains visible; no huge storage footprint.
+        if (cache.isFile && key.isFile && key.readText() == path) {
+            return decode(w, h) { FileInputStream(cache) }
+        }
+        val conn = (java.net.URL(
+            "https://raw.githubusercontent.com/manvendra777/LeafTV-Naruto/main/$encoded"
+        ).openConnection() as java.net.HttpURLConnection).apply {
+            connectTimeout = 7000
+            readTimeout = 12000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "LeafTV-Carousel/1.0")
+        }
+        return try {
+            if (conn.responseCode != 200) throw java.io.IOException("HTTP ${conn.responseCode}")
+            val temp = File(cacheDir, "leaftv-online-carousel.tmp")
+            try {
+                conn.inputStream.use { input ->
+                    java.io.FileOutputStream(temp).use { output ->
+                        val buf = ByteArray(32768)
+                        var total = 0
+                        while (true) {
+                            val count = input.read(buf)
+                            if (count < 0) break
+                            total += count
+                            if (total > 16_000_000) throw java.io.IOException("Wallpaper too large")
+                            output.write(buf, 0, count)
+                        }
+                    }
+                }
+                // Decode before switching the cache: prevent broken images replacing a good one.
+                val bitmap = decode(w, h) { FileInputStream(temp) }
+                    ?: throw java.io.IOException("Invalid wallpaper image")
+                if (!temp.renameTo(cache)) {
+                    temp.copyTo(cache, overwrite = true)
+                    temp.delete()
+                }
+                key.writeText(path)
+                bitmap
+            } finally { temp.delete() }
+        } catch (error: Exception) {
+            android.util.Log.w("LeafTV-Carousel", "Online wallpaper unavailable: $path", error)
+            null
+        } finally { conn.disconnect() }
     }
 
     private fun nextWallpaper() {
@@ -1503,8 +1641,11 @@ class MainActivity : Activity() {
         val dm = resources.displayMetrics
         val w = dm.widthPixels
         val h = dm.heightPixels
-        io.execute {
+        wallpaperIo.execute {
             val bm = try {
+                if (currentPack == "Online Carousel") {
+                    streamCarouselWallpaper(idx, w, h)
+                } else {
                 val ps = packs()
                 val name = currentPack
                 val pack = ps.firstOrNull { it.name == name }
@@ -1514,6 +1655,7 @@ class MainActivity : Activity() {
                     src.startsWith("gen:") -> gradient(s, src.substring(4).toInt(), w, h)
                     src.startsWith("asset:") -> decode(w, h) { assets.open(src.substring(6)) }
                     else -> decode(w, h) { FileInputStream(File(src.substring(5))) }
+                }
                 }
             } catch (t: Throwable) { null }
             if (bm != null) runOnUiThread { if (!isDestroyed) showBitmap(bm) }
